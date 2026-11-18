@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# bigbench — run the largerthanram harness with memory capped BELOW the store size, so
+# lookups genuinely fault instead of hitting page cache (core issue #26).
+#
+#   build/bigbench -size 8GiB -memory 1GiB          # the real thing
+#   build/bigbench -size 1GiB -memory 256MiB -keep  # smaller, keep the store
+#
+# Why a cap is required: every in-tree benchmark runs against a table that fits in
+# page cache, so they measure the SWAR control probe and never the fault path that
+# MADV_RANDOM, control-array residency, and the dirty-chunk Sync strategy exist for.
+# Running the harness uncapped just produces in-cache numbers under a different name —
+# which is worse than no numbers, so the harness itself says so in its output.
+#
+# Mechanism by host:
+#   Linux   systemd-run --scope -p MemoryMax=  (cgroup v2), or cgcreate as a fallback
+#   darwin  an Apple `container` VM with --memory, since cgroups do not exist natively
+set -euo pipefail
+
+SIZE=8GiB
+MEMORY=1GiB
+EXTRA=()
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		-size)   SIZE="$2"; shift 2 ;;
+		-memory) MEMORY="$2"; shift 2 ;;
+		*)       EXTRA+=("$1"); shift ;;
+	esac
+done
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+HARNESS="$REPO/bench/largerthanram"
+
+tobytes() { # 8GiB -> bytes
+	local v="$1"
+	case "$v" in
+		*GiB) echo $(( ${v%GiB} * 1024 * 1024 * 1024 )) ;;
+		*MiB) echo $(( ${v%MiB} * 1024 * 1024 )) ;;
+		*KiB) echo $(( ${v%KiB} * 1024 )) ;;
+		*)    echo "$v" ;;
+	esac
+}
+
+if [[ "$(tobytes "$MEMORY")" -ge "$(tobytes "$SIZE")" ]]; then
+	cat >&2 <<EOF
+bigbench: -memory ($MEMORY) is not below -size ($SIZE).
+
+The whole point is a store larger than the memory it may use. With the cap at or above
+the store size, every lookup is a page-cache hit and the numbers say nothing about the
+fault path — which is the thing #26 exists to measure.
+EOF
+	exit 1
+fi
+
+echo "bigbench: store $SIZE, memory capped at $MEMORY"
+
+case "$(uname -s)" in
+Linux)
+	if command -v systemd-run >/dev/null; then
+		echo "bigbench: using a systemd scope (cgroup v2 MemoryMax)"
+		exec systemd-run --scope --quiet \
+			-p MemoryMax="$MEMORY" -p MemorySwapMax=0 \
+			-- go run "$HARNESS" -size "$SIZE" "${EXTRA[@]+"${EXTRA[@]}"}"
+	fi
+	if command -v cgcreate >/dev/null && [[ "$(id -u)" == "0" ]]; then
+		echo "bigbench: using cgcreate/cgexec"
+		CG="bigbench.$$"
+		trap 'cgdelete -g memory:"$CG" 2>/dev/null || true' EXIT
+		cgcreate -g memory:"$CG"
+		echo "$(tobytes "$MEMORY")" > "/sys/fs/cgroup/$CG/memory.max" 2>/dev/null ||
+			cgset -r memory.limit_in_bytes="$MEMORY" "$CG"
+		exec cgexec -g memory:"$CG" go run "$HARNESS" -size "$SIZE" "${EXTRA[@]+"${EXTRA[@]}"}"
+	fi
+	echo "bigbench: need systemd-run, or cgcreate as root" >&2
+	exit 1
+	;;
+Darwin)
+	if ! command -v container >/dev/null; then
+		cat >&2 <<'EOF'
+bigbench: darwin has no cgroups, so the cap needs a Linux VM.
+
+Install the Apple `container` CLI, or run this on a Linux host. Without a cap the
+harness only produces in-cache numbers, and it will tell you so rather than letting
+them be mistaken for fault-path measurements.
+EOF
+		exit 2
+	fi
+	# The repo tree is far too large to use as a build context directly (a git-archive
+	# context under $HOME is the house pattern), so mount the source read-only instead
+	# and build inside the VM.
+	echo "bigbench: using an Apple container VM (--memory $MEMORY)"
+	exec container run --rm \
+		--memory "$MEMORY" \
+		--volume "$REPO:/src:ro" \
+		--workdir /src/bench/largerthanram \
+		golang:1.26 \
+		sh -c "GOWORK=off GOFLAGS=-mod=mod go run . -size $SIZE ${EXTRA[*]+${EXTRA[*]}}"
+	;;
+*)
+	echo "bigbench: unsupported host $(uname -s)" >&2
+	exit 2
+	;;
+esac

@@ -1,0 +1,24 @@
+# Lives at the build-context root (the repo root) so it is honored by every
+# runtime: Docker (BuildKit and legacy), Podman/Buildah, and Apple `container`.
+# The Dockerfile/compose live under container/ but the context stays the repo root.
+.git
+.gitignore
+.claude
+.vscode
+.DS_Store
+**/.DS_Store
+
+# Docs and the container/ build files — not needed inside the image.
+USERGUIDE.md
+readme.md
+container/
+
+# Test data and any generated store/dataset files.
+testdata/
+sandbox/
+_dev/
+**/_*/
+**/*.core
+**/*.core.*
+**/*.bin
+**/*.meta

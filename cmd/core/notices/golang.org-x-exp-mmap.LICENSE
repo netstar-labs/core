@@ -1,0 +1,63 @@
+This directory contains code derived from golang.org/x/exp/mmap, which is BSD-3-Clause
+licensed. Its license text is reproduced below, and the Go Authors copyright headers in
+this directory's source files refer to this file.
+
+The rest of this repository is licensed under Apache-2.0 (see ../../LICENSE). That does
+not extend to the derived files in this directory, and the BSD-3-Clause terms below are
+not optional:
+
+  * clause 1 requires source redistributions to retain the notice — satisfied by this
+    file travelling with the source;
+  * clause 2 requires that redistributions IN BINARY FORM "reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution."
+
+Clause 2 is the one that matters here, because this repository builds binaries. Any
+distributed artifact that links this package — a server binary, a CLI binary, a container
+image — must carry this notice in its accompanying materials (see ../../THIRD-PARTY-NOTICES).
+
+DERIVED, AND MODIFIED. Diffed against golang.org/x/exp/mmap@v0.0.0-20260727155853:
+
+  mmap_unix.go     upstream, plus a Bytes() accessor on ReaderAt
+  mmap_windows.go  upstream, plus the same Bytes() accessor
+  mmap_other.go    substantially rewritten -- the fallback reads the whole file into
+                   memory at Open so the Bytes() API holds on platforms with no mmap
+                   binding here, where upstream reads through the *os.File instead
+  mmap_test.go     extended (34 -> 101 lines)
+
+NOT DERIVED. These are original netstar-labs work and are not covered by the license
+below; upstream x/exp/mmap is read-only (ReaderAt) and has no writable mapping at all:
+
+  rw.go            the RW type -- a writable MAP_SHARED mapping
+  rw_unix.go       MapRW, Sync, SyncRange on linux/darwin
+  rw_other.go      the non-file-backed fallback
+
+--------------------------------------------------------------------------------
+
+Copyright 2009 The Go Authors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google LLC nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

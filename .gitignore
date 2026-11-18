@@ -1,0 +1,18 @@
+# ignore configurations
+.vscode
+.claude
+
+# ignore directories and generated file types
+testdata/
+sandbox/
+install/
+_*/
+**/*.core
+**/*.core.*
+**/*.bin
+**/*.meta
+**/.DS_Store
+**/~*
+
+# built benchmark binary
+bench/largerthanram/largerthanram

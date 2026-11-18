@@ -1,0 +1,7 @@
+# Extend the default rules; silence only the XXH3 constant table.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "XXH3 default secret: public algorithm constants (key64_NNN), not credentials"
+paths = ['''internal/xxh3/consts\.go''']

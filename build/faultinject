@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# faultinject — prove the resize swap survives a crash between the rename and the
+# directory fsync. This is the half of the durability claim that cannot be tested
+# in-process (core issue #27): resize_durability_test.go asserts the syscall ORDER,
+# and that a directory fsync makes a rename durable is the kernel's contract.
+#
+# Requires Linux with device-mapper and root. It is not runnable on darwin — dm-flakey
+# does not exist there — so the darwin path prints what is missing and exits 2 rather
+# than pretending to pass.
+#
+#   sudo build/faultinject                 # full run
+#   sudo build/faultinject -keep           # leave the loop device for inspection
+#
+# Method: build a 256 MiB loopback filesystem on dm-flakey, grow a store across
+# several resizes on it, then flip the device into its "drop writes" window — which
+# discards un-fsynced metadata exactly as a power loss would — and remount. A store
+# whose rename was durable comes back with the post-resize inode and every key. A
+# store whose rename was NOT durable comes back to the pre-resize inode, and the test
+# below detects it as a short Len().
+set -euo pipefail
+
+KEEP=0
+[[ "${1:-}" == "-keep" ]] && KEEP=1
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+	cat >&2 <<'EOF'
+faultinject: requires Linux (dm-flakey). Not runnable on this host.
+
+What this would prove, and why it is not faked here:
+  resize_durability_test.go already asserts the ordering — msync, rename, syncdir —
+  which is the part core controls. The remaining claim is that a directory fsync makes
+  the rename durable across power loss. That is POSIX, and it is labelled *Reported*
+  rather than *Verified* in docs/audits/ precisely because this script has not been run.
+
+To run it: a Linux box (or VM) with device-mapper and root, then `sudo build/faultinject`.
+EOF
+	exit 2
+fi
+
+if [[ "$(id -u)" != "0" ]]; then
+	echo "faultinject: needs root for losetup/dmsetup" >&2
+	exit 1
+fi
+for tool in losetup dmsetup mkfs.ext4 blockdev; do
+	command -v "$tool" >/dev/null || { echo "faultinject: missing $tool" >&2; exit 1; }
+done
+
+WORK=$(mktemp -d)
+IMG="$WORK/disk.img"
+DM=coreflakey
+MNT="$WORK/mnt"
+LOOP=""
+
+cleanup() {
+	set +e
+	mountpoint -q "$MNT" && umount "$MNT"
+	dmsetup remove "$DM" 2>/dev/null
+	[[ -n "$LOOP" ]] && losetup -d "$LOOP" 2>/dev/null
+	if [[ "$KEEP" == "1" ]]; then
+		echo "faultinject: leaving $WORK in place (-keep)"
+	else
+		rm -rf "$WORK"
+	fi
+}
+trap cleanup EXIT
+
+echo "faultinject: building a 256 MiB loopback device"
+truncate -s 256M "$IMG"
+LOOP=$(losetup --find --show "$IMG")
+SECTORS=$(blockdev --getsz "$LOOP")
+
+# dm-flakey with a long "up" interval: writes pass through normally for now.
+dmsetup create "$DM" --table "0 $SECTORS flakey $LOOP 0 180 0"
+mkfs.ext4 -q -F "/dev/mapper/$DM"
+mkdir -p "$MNT"
+mount "/dev/mapper/$DM" "$MNT"
+
+echo "faultinject: growing a store across several resizes"
+cat > "$WORK/grow.go" <<'GO'
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"os"
+
+	"github.com/netstar-labs/core"
+)
+
+func main() {
+	path, n := os.Args[1], 20000
+	m, err := core.Open(path, 8, 8, 8) // tiny initial capacity forces resizes
+	if err != nil {
+		panic(err)
+	}
+	for i := 0; i < n; i++ {
+		k := binary.BigEndian.AppendUint64(nil, uint64(i))
+		if _, err := m.Put(k, binary.LittleEndian.AppendUint64(nil, uint64(i))); err != nil {
+			panic(err)
+		}
+	}
+	if err := m.Sync(); err != nil {
+		panic(err)
+	}
+	st, _ := os.Stat(path)
+	fmt.Printf("%d %d\n", m.Len(), st.Size())
+	// Deliberately no Close: we are simulating a crash right here, with the rename
+	// and its directory fsync already done.
+	os.Exit(0)
+}
+GO
+( cd "$(dirname "$0")/.." && GOWORK=off go run "$WORK/grow.go" "$MNT/kv.core" ) > "$WORK/before.txt"
+read -r WROTE SIZE < "$WORK/before.txt"
+echo "faultinject: wrote $WROTE entries, store is $SIZE bytes"
+INO_BEFORE=$(stat -c %i "$MNT/kv.core")
+
+echo "faultinject: dropping un-fsynced metadata (simulated power loss)"
+# Flip the table so the device drops writes, then tear the mount down without a clean
+# unmount — anything not already fsynced to the platter is lost.
+dmsetup suspend "$DM"
+dmsetup load "$DM" --table "0 $SECTORS flakey $LOOP 0 0 180 1 drop_writes"
+dmsetup resume "$DM"
+umount -l "$MNT" 2>/dev/null || true
+
+dmsetup suspend "$DM"
+dmsetup load "$DM" --table "0 $SECTORS flakey $LOOP 0 180 0"
+dmsetup resume "$DM"
+mount "/dev/mapper/$DM" "$MNT"
+
+echo "faultinject: verifying the store after the simulated crash"
+cat > "$WORK/verify.go" <<'GO'
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"os"
+	"strconv"
+
+	"github.com/netstar-labs/core"
+)
+
+func main() {
+	path := os.Args[1]
+	want, _ := strconv.Atoi(os.Args[2])
+	k, v, err := core.Geometry(path)
+	if err != nil {
+		fmt.Printf("FAIL geometry unreadable after crash: %v\n", err)
+		os.Exit(1)
+	}
+	m, err := core.Open(path, k, v, 8)
+	if err != nil {
+		fmt.Printf("FAIL store unopenable after crash: %v\n", err)
+		os.Exit(1)
+	}
+	defer m.Close()
+	missing := 0
+	got := make([]byte, v)
+	for i := 0; i < want; i++ {
+		key := binary.BigEndian.AppendUint64(nil, uint64(i))
+		if !m.GetInto(key, got) {
+			missing++
+		}
+	}
+	fmt.Printf("len=%d want=%d missing=%d\n", m.Len(), want, missing)
+	if missing > 0 {
+		fmt.Println("FAIL the resize swap did not survive: the pre-resize inode came back")
+		os.Exit(1)
+	}
+	fmt.Println("PASS every entry survived the simulated power loss")
+}
+GO
+INO_AFTER=$(stat -c %i "$MNT/kv.core" 2>/dev/null || echo "gone")
+echo "faultinject: inode before=$INO_BEFORE after=$INO_AFTER"
+( cd "$(dirname "$0")/.." && GOWORK=off go run "$WORK/verify.go" "$MNT/kv.core" "$WROTE" )
